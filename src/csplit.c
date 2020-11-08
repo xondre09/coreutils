@@ -115,6 +115,16 @@ static void create_output_file (void);
 static void delete_all_files (bool);
 static void save_line_to_file (const struct cstring *line);
 
+/* Shell command to filter through, instead of creating files.  */
+static char const *filter_command;
+
+/* Blocked signals.  */
+static sigset_t oldblocked;
+static sigset_t newblocked;
+
+/* Offset of next chunk. */
+static long int next_chunk_offset = 0;
+
 /* Start of buffer list. */
 static struct buffer_record *head = NULL;
 
@@ -186,7 +196,9 @@ static sigset_t caught_signals;
    non-character as a pseudo short option, starting with CHAR_MAX + 1.  */
 enum
 {
-  SUPPRESS_MATCHED_OPTION = CHAR_MAX + 1
+  SUPPRESS_MATCHED_OPTION = CHAR_MAX + 1,
+  MIN_SIZE_OPTION = CHAR_MAX + 2,
+  FILTER_OPTION =  CHAR_MAX + 3,
 };
 
 static struct option const longopts[] =
@@ -199,10 +211,17 @@ static struct option const longopts[] =
   {"prefix", required_argument, NULL, 'f'},
   {"suffix-format", required_argument, NULL, 'b'},
   {"suppress-matched", no_argument, NULL, SUPPRESS_MATCHED_OPTION},
+  {"min-size", required_argument, NULL, MIN_SIZE_OPTION},
+  {"filter", required_argument, NULL, FILTER_OPTION},
   {GETOPT_HELP_OPTION_DECL},
   {GETOPT_VERSION_OPTION_DECL},
   {NULL, 0, NULL, 0}
 };
+
+
+static uintmax_t n_units = 0;
+
+static char const multipliers[] = "bEGKkMmPTYZ0";
 
 /* Optionally remove files created so far; then exit.
    Called when an error detected. */
@@ -520,7 +539,16 @@ load_buffer (void)
 
       if (xalloc_oversized (2, b->bytes_alloc))
         xalloc_die ();
-      bytes_wanted = 2 * b->bytes_alloc;
+
+      if (b->bytes_used == b->bytes_alloc)
+        {
+          bytes_wanted = 2 * b->bytes_alloc;
+        }
+      else
+        {
+          sleep(0.01);
+        }
+
       free_buffer (b);
       free (b);
     }
@@ -800,6 +828,8 @@ process_regexp (struct control *p, uintmax_t repetition)
   bool ignore = p->ignore;	/* If true, skip this section. */
   regoff_t ret;
 
+  next_chunk_offset += n_units;
+
   if (!ignore)
     create_output_file ();
 
@@ -826,6 +856,17 @@ process_regexp (struct control *p, uintmax_t repetition)
                 regexp_error (p, repetition, ignore);
             }
           line_len = line->len;
+
+          if ((long)  line_len < next_chunk_offset)
+            {
+              line = remove_line ();
+              next_chunk_offset -= line_len;
+              if (!ignore)
+                save_line_to_file (line);
+
+              continue;
+            }
+
           if (line->str[line_len - 1] == '\n')
             line_len--;
           ret = re_search (&p->re_compiled, line->str, line_len,
@@ -838,6 +879,7 @@ process_regexp (struct control *p, uintmax_t repetition)
           if (ret == -1)
             {
               line = remove_line ();
+              next_chunk_offset -= line_len;
               if (!ignore)
                 save_line_to_file (line);
             }
@@ -955,7 +997,7 @@ create_output_file (void)
       fopen_ok = false;
       fopen_errno = EOVERFLOW;
     }
-  else
+  else if (!filter_command)
     {
       /* Create the output file in a critical section, to avoid races.  */
       sigset_t oldset;
@@ -964,6 +1006,55 @@ create_output_file (void)
       fopen_ok = (output_stream != NULL);
       fopen_errno = errno;
       files_created += fopen_ok;
+      sigprocmask (SIG_SETMASK, &oldset, NULL);
+    }
+  else
+    {
+      int fd_pair[2];
+      pid_t child_pid;
+      char const *shell_prog = getenv ("SHELL");
+      sigset_t oldset;
+      sigprocmask (SIG_BLOCK, &caught_signals, &oldset);
+
+      if (shell_prog == NULL)
+        shell_prog = "/bin/sh";
+      if (setenv ("FILE", output_filename, 1) != 0)
+        die (EXIT_FAILURE, errno,
+             _("failed to set FILE environment variable"));
+      if (pipe (fd_pair) != 0)
+        die (EXIT_FAILURE, errno, _("failed to create pipe"));
+
+      fprintf (stdout, _("executing with FILE=%s\n"), quotef (output_filename));
+      child_pid = fork ();
+      if (child_pid == 0)
+        {
+          if (close (fd_pair[1]))
+            die (EXIT_FAILURE, errno, _("closing output pipe"));
+          if (fd_pair[0] != STDIN_FILENO)
+            {
+              if (dup2 (fd_pair[0], STDIN_FILENO) != STDIN_FILENO)
+                die (EXIT_FAILURE, errno, _("moving input pipe"));
+              if (close (fd_pair[0]) != 0)
+                die (EXIT_FAILURE, errno, _("closing input pipe"));
+            }
+
+          sigprocmask (SIG_SETMASK, &oldblocked, NULL);
+          execl (shell_prog, last_component (shell_prog), "-c",
+                 filter_command, (char *) NULL);
+          die (EXIT_FAILURE, errno, _("failed to run command: \"%s -c %s\""),
+               shell_prog, filter_command);
+        }
+      if (child_pid == -1)
+        die (EXIT_FAILURE, errno, _("fork system call failed"));
+      if (close (fd_pair[0]) != 0)
+        die (EXIT_FAILURE, errno, _("failed to close input pipe"));
+      //filter_pid = child_pid;
+
+      output_stream = fdopen (fd_pair[1], "w");
+      fopen_ok = (output_stream != NULL);
+      fopen_errno = errno;
+      files_created += fopen_ok;
+
       sigprocmask (SIG_SETMASK, &oldset, NULL);
     }
 
@@ -1387,7 +1478,16 @@ main (int argc, char **argv)
       case SUPPRESS_MATCHED_OPTION:
         suppress_matched = true;
         break;
-
+      case MIN_SIZE_OPTION:
+        /* Limit to OFF_T_MAX, because if input is a pipe, we could get more
+           data than is possible to write to a single file, so indicate that
+           immediately rather than having possibly future invocations fail. */
+        n_units = xdectoumax (optarg, 1, OFF_T_MAX, multipliers,
+                              _("invalid number of bytes"), 0);
+        break;
+      case FILTER_OPTION:
+        filter_command = optarg;
+        break;
       case_GETOPT_HELP_CHAR;
 
       case_GETOPT_VERSION_CHAR (PROGRAM_NAME, AUTHORS);
@@ -1417,6 +1517,16 @@ main (int argc, char **argv)
   set_input_file (argv[optind++]);
 
   parse_patterns (argc, optind, argv);
+
+  if (filter_command)
+    {
+      struct sigaction act;
+      sigemptyset (&newblocked);
+      sigaction (SIGPIPE, NULL, &act);
+      if (act.sa_handler != SIG_IGN)
+        sigaddset (&newblocked, SIGPIPE);
+      sigprocmask (SIG_BLOCK, &newblocked, &oldblocked);
+    }
 
   {
     int i;
