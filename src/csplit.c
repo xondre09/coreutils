@@ -125,6 +125,9 @@ static sigset_t newblocked;
 /* Offset of next chunk. */
 static long int next_chunk_offset = 0;
 
+/* Initial value of numeric suffixes. */
+static long int numeric_suffixes_start = 0;
+
 /* Start of buffer list. */
 static struct buffer_record *head = NULL;
 
@@ -199,6 +202,7 @@ enum
   SUPPRESS_MATCHED_OPTION = CHAR_MAX + 1,
   MIN_SIZE_OPTION = CHAR_MAX + 2,
   FILTER_OPTION =  CHAR_MAX + 3,
+  NUMERIC_SUFFIXES_START =  CHAR_MAX + 4,
 };
 
 static struct option const longopts[] =
@@ -213,6 +217,7 @@ static struct option const longopts[] =
   {"suppress-matched", no_argument, NULL, SUPPRESS_MATCHED_OPTION},
   {"min-size", required_argument, NULL, MIN_SIZE_OPTION},
   {"filter", required_argument, NULL, FILTER_OPTION},
+  {"numeric-suffixes-start", required_argument, NULL, NUMERIC_SUFFIXES_START},
   {GETOPT_HELP_OPTION_DECL},
   {GETOPT_VERSION_OPTION_DECL},
   {NULL, 0, NULL, 0}
@@ -974,6 +979,7 @@ split_file (void)
 static char *
 make_filename (unsigned int num)
 {
+  num += numeric_suffixes_start;
   strcpy (filename_space, prefix);
   if (suffix)
     sprintf (filename_space + strlen (prefix), suffix, num);
@@ -1478,6 +1484,7 @@ main (int argc, char **argv)
       case SUPPRESS_MATCHED_OPTION:
         suppress_matched = true;
         break;
+
       case MIN_SIZE_OPTION:
         /* Limit to OFF_T_MAX, because if input is a pipe, we could get more
            data than is possible to write to a single file, so indicate that
@@ -1485,9 +1492,16 @@ main (int argc, char **argv)
         n_units = xdectoumax (optarg, 1, OFF_T_MAX, multipliers,
                               _("invalid number of bytes"), 0);
         break;
+
       case FILTER_OPTION:
         filter_command = optarg;
         break;
+
+      case NUMERIC_SUFFIXES_START:
+        numeric_suffixes_start = xdectoimax (optarg, 0, MIN (INT_MAX, SIZE_MAX), "",
+                                             _("invalid number"), 0);
+        break;
+
       case_GETOPT_HELP_CHAR;
 
       case_GETOPT_VERSION_CHAR (PROGRAM_NAME, AUTHORS);
@@ -1616,6 +1630,11 @@ Read standard input if FILE is -\n\
   -n, --digits=DIGITS        use specified number of digits instead of 2\n\
   -s, --quiet, --silent      do not print counts of output file sizes\n\
   -z, --elide-empty-files    remove empty output files\n\
+"), stdout);
+      fputs (_("\
+      --min-size             TODO doc\n\
+      --filtered             TODO doc\n\
+      --numeric-suffixes-start TODO doc\n\
 "), stdout);
       fputs (HELP_OPTION_DESCRIPTION, stdout);
       fputs (VERSION_OPTION_DESCRIPTION, stdout);
